@@ -1,0 +1,51 @@
+#!/usr/bin/bpftrace
+/*
+ * Examine NFS ff_layout_prepare_ds return values
+ *
+ * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
+ * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
+ * Licensed under the GPLv2
+ */
+
+kprobe:rpc_create_xprt {
+  $args = (struct  rpc_create_args *)arg0;
+  @cargs[tid] = $args;
+}
+
+kretprobe:rpc_create_xprt /@cargs[tid]/ {
+  $args = @cargs[tid];
+  delete(@cargs[tid]);
+
+
+  if ((int64)retval < 0) {
+
+    $sa  = (struct sockaddr *)$args->address;
+
+    if ($sa->sa_family == 2) {            /* AF_INET */
+
+      $in = (struct sockaddr_in *)$sa;
+      printf("%s: rpc_create_xprt failed: %s:%u err=%d\n",
+        strftime("%F %H:%M:%S", nsecs),
+        ntop($in->sin_addr.s_addr),
+        bswap((uint16)$in->sin_port),
+        retval);
+    } else if ($sa->sa_family == 10) {    /* AF_INET6 */
+
+      $in6 = (struct sockaddr_in6 *)$sa;
+      printf("%s: rpc_create_xprt failed: [%s]:%u err=%d\n",
+        strftime("%F %H:%M:%S", nsecs),
+        ntop($in6->sin6_addr.in6_u.u6_addr8),
+        bswap((uint16)$in6->sin6_port),
+        retval);
+    } else {
+
+      printf("%s: rpc_create_xprt failed: family=%d err=%d\n",
+        strftime("%F %H:%M:%S", nsecs), $sa->sa_family, retval);
+    }
+  }
+}
+
+END {
+  clear(@cargs);
+}
+

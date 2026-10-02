@@ -1,0 +1,47 @@
+#!/usr/bin/bpftrace
+/*
+ * Examine NFS ff_layout_prepare_ds return values
+ *
+ * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
+ * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
+ * Licensed under the GPLv2
+ */
+
+kprobe:nfs4_ff_layout_prepare_ds {
+
+  $seg = (struct pnfs_layout_segment *)arg0;
+  $range = $seg->pls_range;
+  $inode = $seg->pls_layout->plh_inode;
+
+  @lseg[tid] = $range;
+  @inode[tid] = $inode;
+}
+
+kretprobe:nfs4_ff_layout_prepare_ds /@inode[tid]/ {
+
+  $range = @lseg[tid];
+  $inode = @inode[tid];
+  delete(@lseg[tid]);
+  delete(@inode[tid]);
+
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  printf("%s: nfs4_ff_layout_prepare_ds: inode: %u:%u:%lu, lseg: %s %lu %lu, ",
+       strftime("%F %H:%M:%S", nsecs),
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       $range.iomode == 1 ? "r" : "w",
+       $range.offset, $range.length);
+
+  /* ERR_PTR or a valid DS ? */
+  if (retval >= 0xfffffffffffff001) {
+    printf("err=%d\n", retval);
+  } else {
+    $ds = (struct nfs4_pnfs_ds *)retval;
+    printf("%s\n", str($ds->ds_remotestr));
+  }
+}
+
+END {
+  clear(@lseg);
+  clear(@inode);
+}
