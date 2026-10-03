@@ -1,6 +1,6 @@
 #!/usr/bin/bpftrace
 /*
- * Examine NFS ff_layout_prepare_ds return values
+ * Examine RPC rpc_create_xprt return values
  *
  * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
  * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
