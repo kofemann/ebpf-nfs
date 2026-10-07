@@ -2,6 +2,8 @@
 
 This project provides eBPF-based tracing tools and recipes for monitoring and analyzing NFS/PNFS operations.
 
+The scripts are handwritten with LLM assistance to trace real production issues.
+
 
 ## Requirements
 
