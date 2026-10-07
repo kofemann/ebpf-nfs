@@ -1,0 +1,111 @@
+#!/usr/bin/bpftrace
+/*
+ * List all NFS/pNFS operations executed by the client with a histogram of
+ * the number of calls and the mean, p95 and p99 of their execution times.
+ *
+ * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
+ * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
+ * Licensed under the GPLv2
+ */
+
+/* the number of latency buckets, see below */
+#define NBUCKETS 128
+
+BEGIN {
+  printf("Tracing NFS client operations... Hit Ctrl-C to end.\n");
+}
+
+tracepoint:sunrpc:rpc_stats_latency
+/str(args->progname) == "nfs"/ {
+
+  $exec = (uint64)args->execute;
+
+  @ops[str(args->procname)]++;
+  @sum[str(args->procname)] += $exec;
+
+  /* the longest bar of the histogram */
+  if (@ops[str(args->procname)] > @max) {
+    @max = @ops[str(args->procname)];
+  }
+
+  /*
+   * bpftrace can't calculate percentiles
+   */
+  $b = (uint64)0;
+  while ($b < 31 && ($exec >> ($b + 1)) > 0) {
+    $b++;
+  }
+
+  $idx = $exec;
+  if ($b >= 2) {
+    $idx = $b * 4 + (($exec >> ($b - 2)) & 3);
+  }
+  if ($idx >= NBUCKETS) {
+    $idx = (uint64)(NBUCKETS - 1);
+  }
+
+  @lat[str(args->procname), $idx]++;
+}
+
+END {
+  printf("\n%-24s %10s %-42s %10s %10s %10s\n",
+       "OPERATION", "COUNT", "", "MEAN(us)", "P95(us)", "P99(us)");
+
+  for ($kv : @ops) {
+
+    $count = (uint64)$kv.1;
+
+    printf("%-24s %10d |", $kv.0, $count);
+
+    /*
+     * Bar length is relative to the most frequent operation. 
+     */
+    $len = $count * 40 / (uint64)@max;
+    for ($i : 0..40) {
+      if ((uint64)$i < $len) {
+        printf("@");
+      } else {
+        printf(" ");
+      }
+    }
+
+    /* walk the distribution up to the requested ranks */
+    $r95 = ($count * 95 + 99) / 100;
+    $r99 = ($count * 99 + 99) / 100;
+    $p95 = (uint64)0;
+    $p99 = (uint64)0;
+    $f95 = 0;
+    $f99 = 0;
+    $seen = (uint64)0;
+    for ($j : 0..NBUCKETS) {
+      $idx = (uint64)$j;
+      $n = (uint64)@lat[$kv.0, $idx];
+      if ($n > 0) {
+        $seen += $n;
+
+        /* the upper bound of the bucket */
+        $ub = $idx;
+        if ($idx >= 8) {
+          $ub = ((($idx & 3) + 5) << ($idx / 4 - 2)) - 1;
+        }
+
+        if (!$f95 && $seen >= $r95) {
+          $p95 = $ub;
+          $f95 = 1;
+        }
+        if (!$f99 && $seen >= $r99) {
+          $p99 = $ub;
+          $f99 = 1;
+        }
+      }
+    }
+
+    printf("| %10lu %10lu %10lu\n",
+         (uint64)@sum[$kv.0] / $count, $p95, $p99);
+  }
+
+  clear(@ops);
+  clear(@sum);
+  clear(@lat);
+  clear(@max);
+}
