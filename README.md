@@ -9,6 +9,20 @@ To run the eBPF-based tracing tools, you need to have the `bpftrace` package ins
 
 > Note: You need to have root privileges to run the eBPF-based tracing tools.
 
+### Kernel modules
+
+The scripts use tracepoints inside the NFS kernel modules.
+If a module is not loaded (yet), its probes do not exist and the script fails to
+start. Load the required modules before running a script:
+
+```sh
+modprobe -a sunrpc nfs nfsv4 nfs_layout_flexfiles
+```
+
+```sh
+bpftrace -l 'tracepoint:nfs4:*'
+bpftrace -l 'kprobe:nfs4_ff_layout_prepare_ds'
+```
 
 ## Contributing
 
