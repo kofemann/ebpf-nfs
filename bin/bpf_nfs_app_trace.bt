@@ -1,0 +1,940 @@
+#!/usr/bin/bpftrace
+/*
+ * Trace an application from its start and follow every POSIX I/O call on
+ * NFS files down to the corresponding NFS/pNFS, RPC and TCP events.
+ *
+ * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
+ * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
+ * Licensed under the GPLv2
+ */
+
+/*
+ * The pnfs tracepoints have enum fields which bpftrace can't resolve
+ */
+enum pnfs_iomode {
+  IOMODE_READ = 1,
+  IOMODE_RW = 2,
+  IOMODE_ANY = 3,
+};
+
+enum pnfs_update_layout_reason {
+  PNFS_UPDATE_LAYOUT_UNKNOWN = 0,
+  PNFS_UPDATE_LAYOUT_NO_PNFS,
+  PNFS_UPDATE_LAYOUT_RD_ZEROLEN,
+  PNFS_UPDATE_LAYOUT_MDSTHRESH,
+  PNFS_UPDATE_LAYOUT_NOMEM,
+  PNFS_UPDATE_LAYOUT_BULK_RECALL,
+  PNFS_UPDATE_LAYOUT_IO_TEST_FAIL,
+  PNFS_UPDATE_LAYOUT_FOUND_CACHED,
+  PNFS_UPDATE_LAYOUT_RETURN,
+  PNFS_UPDATE_LAYOUT_RETRY,
+  PNFS_UPDATE_LAYOUT_BLOCKED,
+  PNFS_UPDATE_LAYOUT_INVALID_OPEN,
+  PNFS_UPDATE_LAYOUT_SEND_LAYOUTGET,
+  PNFS_UPDATE_LAYOUT_EXIT,
+};
+
+#define AF_INET 2
+
+#define TCP_ESTABLISHED 1
+#define TCP_SYN_SENT 2
+#define TCP_CLOSE 7
+
+/* who allocated an ID outside of a traced syscall */
+#define OWN_READ 1
+#define OWN_FOLIO 2
+#define OWN_RAHEAD 3
+#define OWN_RELEASE 4
+
+BEGIN {
+
+  @procs[cpid] = 1;
+
+  @st[(uint64)1] = "ESTABLISHED";
+  @st[(uint64)2] = "SYN_SENT";
+  @st[(uint64)3] = "SYN_RECV";
+  @st[(uint64)4] = "FIN_WAIT1";
+  @st[(uint64)5] = "FIN_WAIT2";
+  @st[(uint64)6] = "TIME_WAIT";
+  @st[(uint64)7] = "CLOSE";
+  @st[(uint64)8] = "CLOSE_WAIT";
+  @st[(uint64)9] = "LAST_ACK";
+  @st[(uint64)10] = "LISTEN";
+  @st[(uint64)11] = "CLOSING";
+  @st[(uint64)12] = "NEW_SYN_RECV";
+
+  /* enum pnfs_update_layout_reason */
+  @reason[(uint64)0] = "unknown";
+  @reason[(uint64)1] = "no pnfs";
+  @reason[(uint64)2] = "read zero length";
+  @reason[(uint64)3] = "below mds threshold";
+  @reason[(uint64)4] = "no memory";
+  @reason[(uint64)5] = "bulk recall";
+  @reason[(uint64)6] = "io test fail";
+  @reason[(uint64)7] = "found cached";
+  @reason[(uint64)8] = "layout return";
+  @reason[(uint64)9] = "retry";
+  @reason[(uint64)10] = "blocked";
+  @reason[(uint64)11] = "invalid open";
+  @reason[(uint64)12] = "send layoutget";
+  @reason[(uint64)13] = "exit";
+
+  printf("%-11s %-13s %-7s %-7s %-15s %-16s %-45s %s\n",
+       "TIME(us)", "ID", "PID", "TID", "COMM", "EVENT", "TRACE", "DETAILS");
+}
+
+/*
+ * Process tree. Threads share the pid of the application, subprocesses
+ * are added on fork.
+ */
+
+tracepoint:sched:sched_process_fork /@procs[pid]/ {
+  @procs[(uint64)args->child_pid] = 1;
+}
+
+tracepoint:sched:sched_process_exit /@procs[pid]/ {
+  if (@procs[tid]) { delete(@procs[tid]); }
+  if (@sc[tid]) { delete(@sc[tid]); delete(@scname[tid]); }
+  if (@id[tid]) { delete(@id[tid]); }
+  if (@own[tid]) { delete(@own[tid]); }
+  if (@n[tid]) { delete(@n[tid]); }
+}
+
+/*
+ * Syscalls. Only remember the call here, it is reported as soon as the
+ * thread enters the NFS client.
+ */
+
+tracepoint:syscalls:sys_enter_open /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "open"; }
+tracepoint:syscalls:sys_enter_openat /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "openat"; }
+tracepoint:syscalls:sys_enter_openat2 /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "openat2"; }
+tracepoint:syscalls:sys_enter_read /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "read"; }
+tracepoint:syscalls:sys_enter_pread64 /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "pread64"; }
+tracepoint:syscalls:sys_enter_readv /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "readv"; }
+tracepoint:syscalls:sys_enter_preadv /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "preadv"; }
+tracepoint:syscalls:sys_enter_preadv2 /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "preadv2"; }
+tracepoint:syscalls:sys_enter_mmap /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "mmap"; }
+tracepoint:syscalls:sys_enter_close /@procs[pid]/ { @sc[tid] = nsecs; @scname[tid] = "close"; }
+
+tracepoint:syscalls:sys_exit_open,
+tracepoint:syscalls:sys_exit_openat,
+tracepoint:syscalls:sys_exit_openat2,
+tracepoint:syscalls:sys_exit_read,
+tracepoint:syscalls:sys_exit_pread64,
+tracepoint:syscalls:sys_exit_readv,
+tracepoint:syscalls:sys_exit_preadv,
+tracepoint:syscalls:sys_exit_preadv2,
+tracepoint:syscalls:sys_exit_mmap,
+tracepoint:syscalls:sys_exit_close
+/@sc[tid]/ {
+
+  $id = @id[tid];
+  if ($id) {
+    $ret = (int64)args->ret;
+    printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+         elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RETURN", probe);
+    if ($ret < 0) {
+      printf("ERR errno=%d dur=%luus\n", $ret, (nsecs - @sc[tid]) / 1000);
+    } else {
+      printf("%ld dur=%luus\n", $ret, (nsecs - @sc[tid]) / 1000);
+    }
+  }
+
+  if (@id[tid]) { delete(@id[tid]); }
+  delete(@sc[tid]);
+  delete(@scname[tid]);
+}
+
+/*
+ * NFS entry points: the call is on an NFS file, give it an ID.
+ */
+
+kprobe:nfs_file_read /@procs[pid] && !@id[tid]/ {
+
+  $iocb = (struct kiocb *)arg0;
+  $to = (struct iov_iter *)arg1;
+  $inode = $iocb->ki_filp->f_inode;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe);
+
+  /* io_uring and aio read outside of a read syscall */
+  if (@sc[tid]) {
+    printf("%s", @scname[tid]);
+  } else {
+    @own[tid] = OWN_READ;
+    printf("io_uring/aio");
+  }
+
+  printf(" %u:%u:%lu off=%ld len=%lu\n",
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       $iocb->ki_pos, $to->count);
+}
+
+kretprobe:nfs_file_read /@own[tid] == OWN_READ/ {
+
+  $id = @id[tid];
+  $ret = (int64)retval;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RETURN", probe);
+  if ($ret < 0) {
+    printf("ERR errno=%d\n", $ret);
+  } else {
+    printf("%ld\n", $ret);
+  }
+
+  delete(@id[tid]);
+  delete(@own[tid]);
+}
+
+kprobe:nfs_atomic_open /@procs[pid] && @sc[tid] && !@id[tid]/ {
+
+  $inode = (struct inode *)arg0;
+  $dentry = (struct dentry *)arg1;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s dir=%u:%u:%lu name=%s flags=0x%x\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe,
+       @scname[tid],
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       str($dentry->d_name.name), arg3);
+}
+
+kprobe:nfs4_file_open /@procs[pid] && @sc[tid] && !@id[tid]/ {
+
+  $inode = (struct inode *)arg0;
+  $filp = (struct file *)arg1;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s %u:%u:%lu name=%s flags=0x%x\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe,
+       @scname[tid],
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       str($filp->f_path.dentry->d_name.name), $filp->f_flags);
+}
+
+kprobe:nfs4_file_flush /@procs[pid] && @sc[tid] && !@id[tid]/ {
+
+  $inode = ((struct file *)arg0)->f_inode;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s %u:%u:%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe,
+       @scname[tid],
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino);
+}
+
+kprobe:nfs_file_mmap_prepare /@procs[pid] && @sc[tid] && !@id[tid]/ {
+
+  $desc = (struct vm_area_desc *)arg0;
+  $inode = $desc->file->f_inode;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s %u:%u:%lu off=%lu len=%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe,
+       @scname[tid],
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       $desc->pgoff << 12, $desc->end - $desc->start);
+}
+
+/*
+ * NFS I/O with no syscall around it: page faults on mmap'ed files and
+ * the final close, which runs when the thread returns to user space.
+ * The ID lives as long as the function.
+ */
+
+kprobe:nfs_read_folio /@procs[pid] && !@id[tid]/ {
+
+  $folio = (struct folio *)arg1;
+  $inode = $folio->mapping->host;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+  @own[tid] = OWN_FOLIO;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s read_folio %u:%u:%lu off=%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "FAULT", probe,
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       $folio->index << 12);
+}
+
+kretprobe:nfs_read_folio /@own[tid] == OWN_FOLIO/ {
+  delete(@id[tid]);
+  delete(@own[tid]);
+}
+
+kprobe:nfs_readahead /@procs[pid] && !@id[tid]/ {
+
+  $ractl = (struct readahead_control *)arg0;
+  $inode = $ractl->mapping->host;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+  @own[tid] = OWN_RAHEAD;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s readahead %u:%u:%lu off=%lu len=%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "FAULT", probe,
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
+       $ractl->_index << 12, (uint64)$ractl->_nr_pages << 12);
+}
+
+kretprobe:nfs_readahead /@own[tid] == OWN_RAHEAD/ {
+  delete(@id[tid]);
+  delete(@own[tid]);
+}
+
+kprobe:nfs_file_release /@procs[pid] && !@id[tid]/ {
+
+  $inode = (struct inode *)arg0;
+  $dev = (uint32)$inode->i_sb->s_dev;
+
+  @n[tid]++;
+  $id = ((uint64)tid << 32) | (uint64)@n[tid];
+  @id[tid] = $id;
+  @own[tid] = OWN_RELEASE;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %u:%u:%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RELEASE", probe,
+       $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino);
+}
+
+kretprobe:nfs_file_release /@own[tid] == OWN_RELEASE/ {
+  delete(@id[tid]);
+  delete(@own[tid]);
+}
+
+/*
+ * NFS and pNFS
+ */
+
+tracepoint:nfs4:nfs4_open_file /@id[tid]/ {
+
+  $id = @id[tid];
+  $dev = (uint32)args->dev;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %u:%u:%lu name=%s flags=0x%lx",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "OPEN", probe,
+       $dev >> 20, $dev & ((1 << 20) - 1), args->fileid,
+       str(args->name), args->flags);
+  if (args->error) {
+    printf(" ERR nfs4err=%lu", args->error);
+  }
+  printf("\n");
+}
+
+tracepoint:nfs4:pnfs_update_layout /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s off=%ld len=%lu iomode=%s\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-LAYOUT", probe,
+       @reason[(uint64)args->reason], args->pos, args->count,
+       args->iomode == 1 ? "r" : "w");
+}
+
+tracepoint:nfs4:nfs4_layoutget /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s off=%lu len=%lu iomode=%s",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-LAYOUTGET", probe,
+       args->offset, args->count, args->iomode == 1 ? "r" : "w");
+  printf(" lstateid=%d:0x%08x", args->layoutstateid_seq, args->layoutstateid_hash);
+  if (args->error) {
+    printf(" ERR nfs4err=%lu", args->error);
+  }
+  printf("\n");
+}
+
+/*
+ * Flexfiles layout driver
+ */
+
+/* a layout segment is built from the LAYOUTGET reply */
+kretfunc:nfs_layout_flexfiles:ff_layout_alloc_lseg /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-LSEG", probe);
+
+  /* ERR_PTR or a valid segment ? */
+  if ((uint64)retval >= 0xfffffffffffff001) {
+    printf("ERR err=%d\n", (int64)retval);
+  } else {
+    $ffl = (struct nfs4_ff_layout_segment *)retval;
+    printf("iomode=%s off=%lu len=%lu mirrors=%u stripe_unit=%lu\n",
+         retval->pls_range.iomode == 1 ? "r" : "w",
+         retval->pls_range.offset, retval->pls_range.length,
+         $ffl->mirror_array_cnt, $ffl->stripe_unit);
+  }
+}
+
+/* a data server is built from the GETDEVICEINFO reply */
+kretfunc:nfs_layout_flexfiles:nfs4_ff_alloc_deviceid_node /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-DEVICE", probe);
+  if (retval == 0) {
+    printf("ERR no device\n");
+  } else {
+    printf("ds=%s versions=%u\n",
+         str(retval->ds->ds_remotestr), retval->ds_versions_cnt);
+  }
+}
+
+/* pick and connect the data server of a mirror */
+kretfunc:nfs_layout_flexfiles:nfs4_ff_layout_prepare_ds /@id[tid]/ {
+
+  $id = @id[tid];
+  $range = args->lseg->pls_range;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s lseg=%s %lu %lu dss_id=%u ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-PREPARE", probe,
+       $range.iomode == 1 ? "r" : "w", $range.offset, $range.length,
+       args->dss_id);
+
+  /* ERR_PTR, no DS or a valid DS ? */
+  if ((uint64)retval >= 0xfffffffffffff001) {
+    printf("ERR err=%d\n", (int64)retval);
+  } else if (retval == 0) {
+    printf("ERR no usable DS\n");
+  } else {
+    printf("ds=%s\n", str(retval->ds_remotestr));
+  }
+}
+
+/* 7 arguments, too many for kfunc; minor_version is on the stack */
+kprobe:nfs4_pnfs_ds_connect /@id[tid]/ {
+
+  $id = @id[tid];
+  $ds = (struct nfs4_pnfs_ds *)arg1;
+  @dsc[tid] = arg1;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ds=%s v%u.%u timeo=%u retrans=%u\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-DS-CONNECT", probe,
+       str($ds->ds_remotestr), arg5, (uint32)sarg0, arg3, arg4);
+}
+
+kretprobe:nfs4_pnfs_ds_connect /@dsc[tid]/ {
+
+  $id = @id[tid];
+  $ds = (struct nfs4_pnfs_ds *)@dsc[tid];
+  $ret = (int32)retval;
+  delete(@dsc[tid]);
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ds=%s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-DS-CONNECT", probe,
+       str($ds->ds_remotestr));
+  if ($ret < 0) {
+    printf("ERR status=%d\n", $ret);
+  } else {
+    printf("status=%d\n", $ret);
+  }
+}
+
+/* hand the READ over to the data server */
+kretfunc:nfs_layout_flexfiles:ff_layout_read_pagelist /@id[tid]/ {
+
+  $id = @id[tid];
+  $res = (int64)retval;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s off=%lu len=%u mirror=%u ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-READ", probe,
+       args->hdr->args.offset, args->hdr->args.count,
+       args->hdr->pgio_mirror_idx);
+
+  /* enum pnfs_try_status */
+  if ($res == 0) {
+    printf("sent to DS\n");
+  } else if ($res == 1) {
+    printf("ERR not attempted\n");
+  } else {
+    printf("ERR try again\n");
+  }
+}
+
+/*
+ * The READ reply from the data server is processed in rpciod; remember
+ * the call for the error handling below.
+ */
+kfunc:nfs_layout_flexfiles:ff_layout_read_done_cb {
+
+  $id = @task[(uint32)args->task->tk_client->cl_clid, (uint32)args->task->tk_pid];
+
+  if ($id) {
+    @ffdone[tid] = $id;
+  }
+}
+
+kretfunc:nfs_layout_flexfiles:ff_layout_read_done_cb /@ffdone[tid]/ {
+  delete(@ffdone[tid]);
+}
+
+/*
+ * A DS error is recorded for the next LAYOUTRETURN.
+ * 8 arguments, too many for kfunc; opnum and error are on the stack.
+ */
+kprobe:ff_layout_io_track_ds_error /@ffdone[tid]/ {
+
+  $id = @ffdone[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR mirror=%u dss_id=%u off=%lu len=%lu opnum=%d nfs4err=%u error=%d\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-DSERR", probe,
+       arg1, arg2, arg3, arg4,
+       (int32)sarg0, *(uint32 *)arg5, (int32)sarg1);
+}
+
+tracepoint:nfs4:nfs4_getdeviceinfo /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s server=%s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-DEVINFO", probe,
+       str(args->dstaddr));
+  if (args->status < 0) {
+    printf("ERR status=%d\n", args->status);
+  } else {
+    printf("status=%d\n", args->status);
+  }
+}
+
+/* no usable layout or DS, the READ goes to the MDS */
+tracepoint:nfs4:pnfs_mds_fallback_pg_init_read /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s no layout, READ via MDS off=%ld len=%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FALLBACK", probe,
+       args->pos, args->count);
+}
+
+tracepoint:nfs4:pnfs_mds_fallback_read_pagelist /@id[tid]/ {
+
+  $id = @id[tid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s no DS, READ via MDS off=%ld len=%lu\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FALLBACK", probe,
+       args->pos, args->count);
+}
+
+/*
+ * The READ completes in rpciod and may be re-sent from a workqueue after
+ * a DS error, so remember which call asked for this range of the file.
+ */
+tracepoint:nfs:nfs_initiate_read /@id[tid]/ {
+
+  $id = @id[tid];
+  @io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset] = $id;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s off=%ld len=%u\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "READ-INIT", probe,
+       args->offset, args->count);
+}
+
+tracepoint:nfs4:nfs4_pnfs_read
+/@io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset]/ {
+
+  $id = @io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s off=%ld req=%u res=%u",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-READ", probe,
+       args->offset, args->arg_count, args->res_count);
+  printf(" lstateid=%d:0x%08x", args->layoutstateid_seq, args->layoutstateid_hash);
+  if (args->error) {
+    printf(" ERR nfs4err=%lu\n", args->error);
+  } else {
+    printf("\n");
+    delete(@io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset]);
+  }
+}
+
+tracepoint:nfs4:nfs4_read
+/@io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset]/ {
+
+  $id = @io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s off=%ld req=%u res=%u",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "READ-MDS", probe,
+       args->offset, args->arg_count, args->res_count);
+  if (args->error) {
+    printf(" ERR nfs4err=%lu\n", args->error);
+  } else {
+    printf("\n");
+    delete(@io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset]);
+  }
+}
+
+tracepoint:nfs4:ff_layout_read_error
+/@io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset]/ {
+
+  $id = @io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR ds=%s off=%ld len=%u err=%d nfs4err=%u\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-DS-ERR", probe,
+       str(args->dstaddr), args->offset, args->count,
+       args->error, args->nfs_error);
+}
+
+/*
+ * RPC. A task started by a thread while it holds an ID belongs to that
+ * call, wherever the task runs later.
+ */
+
+tracepoint:sunrpc:rpc_task_begin /@id[tid]/ {
+  @task[(uint32)args->client_id, (uint32)args->task_id] = @id[tid];
+}
+
+tracepoint:sunrpc:rpc_request
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s %s v%d %s %s task=%u/%u\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC", probe,
+       str(args->progname), args->version, str(args->procname),
+       args->async ? "async" : "sync", args->client_id, args->task_id);
+}
+
+tracepoint:sunrpc:rpc_connect_status
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "CONNECT", probe);
+  if (args->status < 0) {
+    printf("ERR status=%d\n", args->status);
+  } else {
+    printf("status=%d\n", args->status);
+  }
+}
+
+tracepoint:sunrpc:xprt_transmit
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s xid=0x%08x ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "XMIT", probe,
+       args->xid);
+  if (args->status < 0) {
+    printf("ERR status=%d\n", args->status);
+  } else {
+    printf("status=%d\n", args->status);
+  }
+}
+
+tracepoint:sunrpc:xprt_retransmit
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s xid=0x%08x %s ntrans=%d\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC-RETRANS", probe,
+       args->xid, str(args->procname), args->ntrans);
+}
+
+tracepoint:sunrpc:rpc_timeout_status
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR status=%d\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC-TIMEOUT", probe,
+       args->status);
+}
+
+tracepoint:sunrpc:xprt_timer /@xid[(uint32)args->xid]/ {
+
+  $id = @xid[(uint32)args->xid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR xid=0x%08x peer=[%s]:%s status=%d\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC-TIMEOUT", probe,
+       args->xid, str(args->addr), str(args->port), args->status);
+}
+
+tracepoint:sunrpc:rpc_stats_latency
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s xid=0x%08x %s backlog=%luus rtt=%luus exec=%luus\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC-DONE", probe,
+       args->xid, str(args->procname),
+       args->backlog, args->rtt, args->execute);
+
+  /* the last event of a task, it comes after rpc_task_end */
+  if (@xid[(uint32)args->xid]) { delete(@xid[(uint32)args->xid]); }
+  delete(@task[(uint32)args->client_id, (uint32)args->task_id]);
+}
+
+tracepoint:sunrpc:rpc_task_end
+/@task[(uint32)args->client_id, (uint32)args->task_id]/ {
+
+  $id = @task[(uint32)args->client_id, (uint32)args->task_id];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s task=%u/%u ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "RPC-END", probe,
+       args->client_id, args->task_id);
+  if (args->status < 0) {
+    printf("ERR status=%d\n", args->status);
+  } else {
+    printf("status=%d\n", args->status);
+  }
+}
+
+/*
+ * RPC to TCP. The request is written to the socket by the thread that
+ * runs xs_tcp_send_request, the reply is matched by XID.
+ */
+
+kfunc:sunrpc:xs_tcp_send_request {
+
+  $task = args->req->rq_task;
+  $id = @task[(uint32)$task->tk_client->cl_clid, (uint32)$task->tk_pid];
+
+  if ($id) {
+    @send[tid] = $id;
+    @xid[(uint32)bswap(args->req->rq_xid)] = $id;
+  }
+}
+
+kretfunc:sunrpc:xs_tcp_send_request /@send[tid]/ {
+  delete(@send[tid]);
+  if (@ssk[tid]) { delete(@ssk[tid]); }
+  if (@slen[tid]) { delete(@slen[tid]); }
+}
+
+kprobe:tcp_sendmsg /@send[tid]/ {
+  @ssk[tid] = arg0;
+  @slen[tid] = arg2;
+  @nfs_sk[arg0] = 1;
+}
+
+kretprobe:tcp_sendmsg /@ssk[tid]/ {
+
+  $id = @send[tid];
+  $sk = (struct sock *)@ssk[tid];
+  $ret = (int32)retval;
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "TCP-SEND", probe);
+  if ($sk->__sk_common.skc_family == AF_INET) {
+    printf("%s:%d -> %s:%d ",
+         ntop($sk->__sk_common.skc_rcv_saddr), $sk->__sk_common.skc_num,
+         ntop($sk->__sk_common.skc_daddr), bswap($sk->__sk_common.skc_dport));
+  } else {
+    printf("[%s]:%d -> [%s]:%d ",
+         ntop($sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8), $sk->__sk_common.skc_num,
+         ntop($sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8), bswap($sk->__sk_common.skc_dport));
+  }
+  if ($ret < 0) {
+    printf("bytes=%lu ERR errno=%d\n", @slen[tid], $ret);
+  } else {
+    printf("bytes=%lu ret=%d\n", @slen[tid], $ret);
+  }
+
+  delete(@ssk[tid]);
+  delete(@slen[tid]);
+}
+
+tracepoint:sunrpc:xs_stream_read_request /@xid[(uint32)args->xid]/ {
+
+  $id = @xid[(uint32)args->xid];
+
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s xid=0x%08x peer=[%s]:%s copied=%lu reclen=%u\n",
+       elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "REPLY", probe,
+       args->xid, str(args->addr), str(args->port),
+       args->copied, args->reclen);
+}
+
+/*
+ * TCP connections of the RPC client, including the handshake. These
+ * events belong to a connection and not to a single call.
+ */
+
+kfunc:sunrpc:xs_tcp_setup_socket {
+  @conn[tid] = 1;
+}
+
+kretfunc:sunrpc:xs_tcp_setup_socket /@conn[tid]/ {
+  delete(@conn[tid]);
+  if (@csk[tid]) { delete(@csk[tid]); }
+}
+
+kprobe:tcp_v4_connect,
+kprobe:tcp_v6_connect
+/@conn[tid]/ {
+  @csk[tid] = arg0;
+  @cua[tid] = arg1;
+  @nfs_sk[arg0] = 1;
+}
+
+kretprobe:tcp_v4_connect,
+kretprobe:tcp_v6_connect
+/@csk[tid]/ {
+
+  $sk = (struct sock *)@csk[tid];
+  $ret = (int32)retval;
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "TCP-CONNECT", probe);
+
+  if ($ret < 0) {
+    /* the socket has no addresses, show the requested target */
+    $sa = (struct sockaddr *)@cua[tid];
+    if ($sa->sa_family == AF_INET) {
+      $sin = (struct sockaddr_in *)@cua[tid];
+      printf("-> %s:%d ", ntop($sin->sin_addr.s_addr), bswap($sin->sin_port));
+    } else {
+      $sin6 = (struct sockaddr_in6 *)@cua[tid];
+      printf("-> [%s]:%d scope=%u ", ntop($sin6->sin6_addr.in6_u.u6_addr8),
+           bswap($sin6->sin6_port), $sin6->sin6_scope_id);
+    }
+    printf("ERR errno=%d\n", $ret);
+  } else {
+    if ($sk->__sk_common.skc_family == AF_INET) {
+      printf("%s:%d -> %s:%d ",
+           ntop($sk->__sk_common.skc_rcv_saddr), $sk->__sk_common.skc_num,
+           ntop($sk->__sk_common.skc_daddr), bswap($sk->__sk_common.skc_dport));
+    } else {
+      printf("[%s]:%d -> [%s]:%d ",
+           ntop($sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8), $sk->__sk_common.skc_num,
+           ntop($sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8), bswap($sk->__sk_common.skc_dport));
+    }
+    printf("SYN sent\n");
+  }
+
+  delete(@csk[tid]);
+  delete(@cua[tid]);
+}
+
+tracepoint:sunrpc:rpc_socket_connect /@conn[tid]/ {
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "SOCK-CONNECT", probe);
+
+  /* EINPROGRESS: the handshake is still running */
+  if (args->error < 0 && args->error != -115) {
+    printf("ERR error=%d sk_state=%s\n", args->error, @st[(uint64)args->sock_state]);
+  } else {
+    printf("error=%d sk_state=%s\n", args->error, @st[(uint64)args->sock_state]);
+  }
+}
+
+/* reported for every socket of the RPC client, not only the traced ones */
+tracepoint:sunrpc:rpc_socket_error {
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ERR error=%d sk_state=%s\n",
+       elapsed / 1000, "-", pid, tid, comm, "SOCK-ERR", probe,
+       args->error, @st[(uint64)args->sock_state]);
+}
+
+tracepoint:sock:inet_sock_set_state /@nfs_sk[(uint64)args->skaddr]/ {
+
+  $sk = (uint64)args->skaddr;
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "TCP-STATE", probe);
+  if (args->family == AF_INET) {
+    printf("%s:%d -> %s:%d ",
+         ntop(args->saddr), args->sport, ntop(args->daddr), args->dport);
+  } else {
+    printf("[%s]:%d -> [%s]:%d ",
+         ntop(args->saddr_v6), args->sport, ntop(args->daddr_v6), args->dport);
+  }
+  printf("%s -> %s", @st[(uint64)args->oldstate], @st[(uint64)args->newstate]);
+
+  if (args->newstate == TCP_SYN_SENT) {
+    @syn[$sk] = nsecs;
+  }
+  if (args->newstate == TCP_ESTABLISHED && @syn[$sk]) {
+    printf(" handshake=%luus", (nsecs - @syn[$sk]) / 1000);
+    delete(@syn[$sk]);
+  }
+  printf("\n");
+
+  if (args->newstate == TCP_CLOSE) {
+    delete(@nfs_sk[$sk]);
+    if (@syn[$sk]) { delete(@syn[$sk]); }
+  }
+}
+
+tracepoint:tcp:tcp_retransmit_skb /@nfs_sk[(uint64)args->skaddr]/ {
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "TCP-RETRANS", probe);
+  if (args->family == AF_INET) {
+    printf("%s:%d -> %s:%d ",
+         ntop(args->saddr), args->sport, ntop(args->daddr), args->dport);
+  } else {
+    printf("[%s]:%d -> [%s]:%d ",
+         ntop(args->saddr_v6), args->sport, ntop(args->daddr_v6), args->dport);
+  }
+  printf("state=%s err=%d\n", @st[(uint64)args->state], args->err);
+}
+
+tracepoint:tcp:tcp_receive_reset /@nfs_sk[(uint64)args->skaddr]/ {
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "TCP-RESET", probe);
+  if (args->family == AF_INET) {
+    printf("ERR %s:%d -> %s:%d\n",
+         ntop(args->saddr), args->sport, ntop(args->daddr), args->dport);
+  } else {
+    printf("ERR [%s]:%d -> [%s]:%d\n",
+         ntop(args->saddr_v6), args->sport, ntop(args->daddr_v6), args->dport);
+  }
+}
+
+END {
+  clear(@procs);
+  clear(@st);
+  clear(@reason);
+  clear(@sc);
+  clear(@scname);
+  clear(@n);
+  clear(@id);
+  clear(@own);
+  clear(@dsc);
+  clear(@ffdone);
+  clear(@io);
+  clear(@task);
+  clear(@xid);
+  clear(@send);
+  clear(@ssk);
+  clear(@slen);
+  clear(@conn);
+  clear(@csk);
+  clear(@cua);
+  clear(@syn);
+  clear(@nfs_sk);
+}
