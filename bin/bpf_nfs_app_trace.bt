@@ -3,6 +3,8 @@
  * Trace an application from its start and follow every POSIX I/O call on
  * NFS files down to the corresponding NFS/pNFS, RPC and TCP events.
  *
+ * For the RHEL 9 kernel 5.14.0 (9.3 or newer, which has nfs_read_folio).
+ *
  * Copyright 2026 Deutsches Elektronen-Synchrotron DESY
  * Author: Tigran Mkrtchyan <tigran.mkrtchyan@desy.de>
  * Licensed under the GPLv2
@@ -254,10 +256,10 @@ kprobe:nfs4_file_flush /@procs[pid] && @sc[tid] && !@id[tid]/ {
        $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino);
 }
 
-kprobe:nfs_file_mmap_prepare /@procs[pid] && @sc[tid] && !@id[tid]/ {
+kprobe:nfs_file_mmap /@procs[pid] && @sc[tid] && !@id[tid]/ {
 
-  $desc = (struct vm_area_desc *)arg0;
-  $inode = $desc->file->f_inode;
+  $vma = (struct vm_area_struct *)arg1;
+  $inode = ((struct file *)arg0)->f_inode;
   $dev = (uint32)$inode->i_sb->s_dev;
 
   @n[tid]++;
@@ -268,7 +270,7 @@ kprobe:nfs_file_mmap_prepare /@procs[pid] && @sc[tid] && !@id[tid]/ {
        elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "SYSCALL", probe,
        @scname[tid],
        $dev >> 20, $dev & ((1 << 20) - 1), $inode->i_ino,
-       $desc->pgoff << 12, $desc->end - $desc->start);
+       $vma->vm_pgoff << 12, $vma->vm_end - $vma->vm_start);
 }
 
 /*
@@ -429,10 +431,9 @@ kretfunc:nfs_layout_flexfiles:nfs4_ff_layout_prepare_ds /@id[tid]/ {
   $id = @id[tid];
   $range = args->lseg->pls_range;
 
-  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s lseg=%s %lu %lu dss_id=%u ",
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s lseg=%s %lu %lu ",
        elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-PREPARE", probe,
-       $range.iomode == 1 ? "r" : "w", $range.offset, $range.length,
-       args->dss_id);
+       $range.iomode == 1 ? "r" : "w", $range.offset, $range.length);
 
   /* ERR_PTR, no DS or a valid DS ? */
   if ((uint64)retval >= 0xfffffffffffff001) {
@@ -513,16 +514,16 @@ kretfunc:nfs_layout_flexfiles:ff_layout_read_done_cb /@ffdone[tid]/ {
 
 /*
  * A DS error is recorded for the next LAYOUTRETURN.
- * 8 arguments, too many for kfunc; opnum and error are on the stack.
+ * 7 arguments, too many for kfunc; error is on the stack.
  */
 kprobe:ff_layout_io_track_ds_error /@ffdone[tid]/ {
 
   $id = @ffdone[tid];
 
-  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR mirror=%u dss_id=%u off=%lu len=%lu opnum=%d nfs4err=%u error=%d\n",
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR mirror=%u off=%lu len=%lu opnum=%d nfs4err=%u error=%d\n",
        elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-FF-DSERR", probe,
-       arg1, arg2, arg3, arg4,
-       (int32)sarg0, *(uint32 *)arg5, (int32)sarg1);
+       arg1, arg2, arg3,
+       (int32)arg5, *(uint32 *)arg4, (int32)sarg0);
 }
 
 tracepoint:nfs4:nfs4_getdeviceinfo /@id[tid]/ {
@@ -610,10 +611,10 @@ tracepoint:nfs4:ff_layout_read_error
 
   $id = @io[(uint32)args->dev, (uint64)args->fileid, (uint64)args->offset];
 
-  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR ds=%s off=%ld len=%u err=%d nfs4err=%u\n",
+  printf("%-11llu %7d.%-5d %-7d %-7d %-15s %-16s %-45s ERR ds=%s off=%ld len=%u nfs4err=%lu\n",
        elapsed / 1000, $id >> 32, $id & 0xffffffff, pid, tid, comm, "pNFS-DS-ERR", probe,
        str(args->dstaddr), args->offset, args->count,
-       args->error, args->nfs_error);
+       args->error);
 }
 
 /*
@@ -829,7 +830,7 @@ kretprobe:tcp_v6_connect
       printf("-> %s:%d ", ntop($sin->sin_addr.s_addr), bswap($sin->sin_port));
     } else {
       $sin6 = (struct sockaddr_in6 *)@cua[tid];
-      printf("-> [%s]:%d scope=%u ", ntop($sin6->sin6_addr.in6_u.u6_addr8),
+      printf("-> [%s]:%d scope=%u ", ntop($sin6->sin6_addr),
            bswap($sin6->sin6_port), $sin6->sin6_scope_id);
     }
     printf("ERR errno=%d\n", $ret);
@@ -911,7 +912,7 @@ tracepoint:tcp:tcp_retransmit_skb /@nfs_sk[(uint64)args->skaddr]/ {
     printf("[%s]:%d -> [%s]:%d ",
          ntop(args->saddr_v6), args->sport, ntop(args->daddr_v6), args->dport);
   }
-  printf("state=%s err=%d\n", @st[(uint64)args->state], args->err);
+  printf("state=%s\n", @st[(uint64)args->state]);
 }
 
 tracepoint:tcp:tcp_receive_reset /@nfs_sk[(uint64)args->skaddr]/ {
