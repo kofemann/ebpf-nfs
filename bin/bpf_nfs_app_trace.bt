@@ -34,6 +34,18 @@ enum pnfs_update_layout_reason {
   PNFS_UPDATE_LAYOUT_EXIT,
 };
 
+/*
+ * The rpc_socket tracepoints have arrays of sizeof(struct sockaddr_in6),
+ * which bpftrace can't resolve from BTF
+ */
+struct sockaddr_in6 {
+  unsigned short sin6_family;
+  unsigned short sin6_port;
+  unsigned int sin6_flowinfo;
+  unsigned char sin6_addr[16];
+  unsigned int sin6_scope_id;
+};
+
 #define AF_INET 2
 
 #define TCP_ESTABLISHED 1
