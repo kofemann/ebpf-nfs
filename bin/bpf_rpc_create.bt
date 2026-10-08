@@ -9,43 +9,67 @@
 
 kprobe:rpc_create_xprt {
   $args = (struct  rpc_create_args *)arg0;
+  $xprt = (struct rpc_xprt *)arg1;
   @cargs[tid] = $args;
+  @xprt[tid] = $xprt;
 }
 
 kretprobe:rpc_create_xprt /@cargs[tid]/ {
   $args = @cargs[tid];
-  delete(@cargs[tid]);
+  $xprt = @xprt[tid];
 
+  delete(@xprt[tid]);
+  delete(@cargs[tid]);
+  $connect_status = (uint64)0;
+
+  if (has_key(@xprt_status, $xprt)) {
+    $connect_status = @xprt_status[$xprt];
+    delete(@xprt_status[$xprt]);
+  }
 
   if ((int64)retval < 0) {
 
     $sa  = (struct sockaddr *)$args->address;
 
+    printf("%s: %s failed: xid: %x ", strftime("%F %H:%M:%S", nsecs), func, $xprt->xid );
+
     if ($sa->sa_family == 2) {            /* AF_INET */
 
       $in = (struct sockaddr_in *)$sa;
-      printf("%s: rpc_create_xprt failed: %s:%u err=%d\n",
-        strftime("%F %H:%M:%S", nsecs),
+      printf("%s:%u",
         ntop($in->sin_addr.s_addr),
-        bswap((uint16)$in->sin_port),
-        retval);
+        bswap((uint16)$in->sin_port));
     } else if ($sa->sa_family == 10) {    /* AF_INET6 */
 
       $in6 = (struct sockaddr_in6 *)$sa;
-      printf("%s: rpc_create_xprt failed: [%s]:%u err=%d\n",
-        strftime("%F %H:%M:%S", nsecs),
+      printf("[%s]:%u",
         ntop($in6->sin6_addr.in6_u.u6_addr8),
-        bswap((uint16)$in6->sin6_port),
-        retval);
+        bswap((uint16)$in6->sin6_port));
     } else {
-
-      printf("%s: rpc_create_xprt failed: family=%d err=%d\n",
-        strftime("%F %H:%M:%S", nsecs), $sa->sa_family, retval);
+      printf("family=%d", $sa->sa_family);
     }
+
+    printf(" err=%d connection_status=%d\n", retval, $connect_status);
   }
 }
 
+kprobe:xs_tcp_finish_connecting {
+   $xprt = (struct rpc_xprt *)arg0;
+   @xprt[tid] = $xprt;
+
+}
+
+kretprobe:xs_tcp_finish_connecting / @xprt[tid] / {
+
+  $xprt = @xprt[tid];
+  delete(@xprt[tid]);
+
+  @xprt_status[$xprt] = retval;
+}
+
 END {
+  clear(@xprt);
+  clear(@xprt_status);
   clear(@cargs);
 }
 
