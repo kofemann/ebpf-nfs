@@ -474,6 +474,76 @@ kretprobe:nfs4_pnfs_ds_connect /@dsc[tid]/ {
   }
 }
 
+/*
+ * RPC transport creation, below nfs4_pnfs_ds_connect(); see
+ * bin/bpf_rpc_create.bt for the same idiom. rpc_create() builds the rpc_clnt
+ * of the DS nfs_client; with nconnect > 1 it adds the remaining transports
+ * through rpc_clnt_add_xprt() -> xprt_create_transport(). Counting both under
+ * one pNFS-DS-CONNECT tells two DS clients apart from one nconnect client.
+ */
+
+kprobe:rpc_create {
+  $args = (struct rpc_create_args *)arg0;
+  @rcargs[tid] = $args;
+}
+
+kretprobe:rpc_create /@rcargs[tid]/ {
+  $args = @rcargs[tid];
+  $clnt = (struct rpc_clnt *)retval;
+
+  delete(@rcargs[tid]);
+
+  $sa = (struct sockaddr *)$args->address;
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "RPC-CREATE", probe);
+  if ($sa->sa_family == AF_INET) {
+    $in = (struct sockaddr_in *)$sa;
+    printf("%s:%u ", ntop($in->sin_addr.s_addr), bswap((uint16)$in->sin_port));
+  } else {
+    $in6 = (struct sockaddr_in6 *)$sa;
+    printf("[%s]:%u ", ntop($in6->sin6_addr), bswap((uint16)$in6->sin6_port));
+  }
+
+  if ((int64)retval < 0) {
+    printf("ERR err=%d\n", (int64)retval);
+  } else {
+    printf("nconnect=%u max_connect=%u clnt=%llx cl_clid=%u\n",
+         $args->nconnect, $args->max_connect, (uint64)retval, $clnt->cl_clid);
+  }
+}
+
+kprobe:xprt_create_transport {
+  $args = (struct xprt_create *)arg0;
+  @xtargs[tid] = $args;
+}
+
+kretprobe:xprt_create_transport /@xtargs[tid]/ {
+  $args = @xtargs[tid];
+  $xprt = (struct rpc_xprt *)retval;
+
+  delete(@xtargs[tid]);
+
+  $sa = (struct sockaddr *)$args->dstaddr;
+
+  printf("%-11llu %-13s %-7d %-7d %-15s %-16s %-45s ",
+       elapsed / 1000, "-", pid, tid, comm, "XPRT-CREATE", probe);
+  if ($sa->sa_family == AF_INET) {
+    $in = (struct sockaddr_in *)$sa;
+    printf("%s:%u ", ntop($in->sin_addr.s_addr), bswap((uint16)$in->sin_port));
+  } else {
+    $in6 = (struct sockaddr_in6 *)$sa;
+    printf("[%s]:%u ", ntop($in6->sin6_addr), bswap((uint16)$in6->sin6_port));
+  }
+
+  if ((int64)retval < 0) {
+    printf("ERR err=%d\n", (int64)retval);
+  } else {
+    printf("ident=%d servername=%s xprt=%llx xid=%x\n",
+         $args->ident, str($args->servername), (uint64)retval, $xprt->xid);
+  }
+}
+
 /* hand the READ over to the data server */
 kretfunc:nfs_layout_flexfiles:ff_layout_read_pagelist /@id[tid]/ {
 
@@ -497,18 +567,20 @@ kretfunc:nfs_layout_flexfiles:ff_layout_read_pagelist /@id[tid]/ {
 
 /*
  * The READ reply from the data server is processed in rpciod; remember
- * the call for the error handling below.
+ * the call for the error handling below. The symbol has no BTF, so attach
+ * it with kprobe and take the task from arg0 (kfunc needs BTF).
  */
-kfunc:nfs_layout_flexfiles:ff_layout_read_done_cb {
+kprobe:ff_layout_read_done_cb {
 
-  $id = @task[(uint32)args->task->tk_client->cl_clid, (uint32)args->task->tk_pid];
+  $task = (struct rpc_task *)arg0;
+  $id = @task[(uint32)$task->tk_client->cl_clid, (uint32)$task->tk_pid];
 
   if ($id) {
     @ffdone[tid] = $id;
   }
 }
 
-kretfunc:nfs_layout_flexfiles:ff_layout_read_done_cb /@ffdone[tid]/ {
+kretprobe:ff_layout_read_done_cb /@ffdone[tid]/ {
   delete(@ffdone[tid]);
 }
 
@@ -938,6 +1010,8 @@ END {
   clear(@id);
   clear(@own);
   clear(@dsc);
+  clear(@rcargs);
+  clear(@xtargs);
   clear(@ffdone);
   clear(@io);
   clear(@task);
