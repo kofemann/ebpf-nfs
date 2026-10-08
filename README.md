@@ -13,6 +13,8 @@ To run the eBPF-based tracing tools, you need to have the `bpftrace` package ins
 
 ### Kernel modules
 
+All scripts are tested under RHEL 9.8.
+
 The scripts use tracepoints inside the NFS kernel modules.
 If a module is not loaded (yet), its probes do not exist and the script fails to
 start. Load the required modules before running a script:
